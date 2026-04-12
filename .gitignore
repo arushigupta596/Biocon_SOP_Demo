@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment — never commit secrets
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Streamlit Cloud secrets (set via dashboard, not committed)
+.streamlit/secrets.toml
+
+# Pytest cache
+.pytest_cache/
+
+# Output files — regenerated at runtime
+output/gap_registry*.json
+output/gap_report_*.docx
+output/corpus_manifest.json
+output/scan_cache.json
+
+# Keep the output directory skeleton
+!output/.gitkeep
+
+# Raw data folder (not needed in deployment)
+Data/
+
+# Synthetic SOP scratch folder
+"synthetic SOP"/
