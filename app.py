@@ -514,6 +514,16 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 
 if page == "Scan SOP":
+    # ── Persist scan result across Streamlit reruns ──────────────────────
+    if "scan_result"    not in st.session_state:
+        st.session_state.scan_result    = None
+    if "scan_file_name" not in st.session_state:
+        st.session_state.scan_file_name = None
+    if "report_bytes"   not in st.session_state:
+        st.session_state.report_bytes   = None
+    if "report_name"    not in st.session_state:
+        st.session_state.report_name    = None
+
     st.markdown('<p class="page-title">Scan SOP for Compliance Gaps</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="page-desc">Upload a Word or PDF SOP document. The engine parses it '
@@ -534,6 +544,13 @@ if page == "Scan SOP":
         size_kb    = round(len(file_bytes) / 1024, 1)
         fhash      = _file_hash(file_bytes)
         save_path  = SOPS_DIR / uploaded.name
+
+        # Clear previous results when a different file is uploaded
+        if uploaded.name != st.session_state.scan_file_name:
+            st.session_state.scan_result    = None
+            st.session_state.report_bytes   = None
+            st.session_state.report_name    = None
+
         save_path.write_bytes(file_bytes)
 
         cached_scan = _cached_scan(fhash)
@@ -582,53 +599,63 @@ if page == "Scan SOP":
                     if scan:
                         _write_cache(fhash, scan.sop_id, scan.sop_file)
 
-            if rc == 0:
-
-                if scan:
-                    crit  = sum(1 for f in scan.findings if f.severity.value == "CRITICAL")
-                    maj   = sum(1 for f in scan.findings if f.severity.value == "MAJOR")
-                    minor = sum(1 for f in scan.findings if f.severity.value == "MINOR")
-
-                    if crit > 0:
-                        st.error(f"Scan complete — {scan.gaps_found} gap(s) identified, "
-                                 f"including {crit} critical finding(s) requiring immediate attention.")
-                    else:
-                        st.success(f"Scan complete — {scan.gaps_found} gap(s) identified.")
-
-                    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Total Gaps",   scan.gaps_found)
-                    c2.metric("Critical",     crit)
-                    c3.metric("Major",        maj)
-                    c4.metric("Minor",        minor)
-
-                    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-                    st.markdown('<p class="section-label">Gap Findings</p>', unsafe_allow_html=True)
-
-                    SEV_ORDER = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
-                    for i, f in enumerate(
-                        sorted(scan.findings,
-                               key=lambda x: (SEV_ORDER[x.severity.value], x.sop_clause)), 1
-                    ):
-                        st.markdown(gap_card(i, f), unsafe_allow_html=True)
-
-                    # Auto-generate report
-                    run_cmd(["-m", "src.report.generator",
-                             "--registry", "output/gap_registry.json"])
-                    rpt = report_path()
-                    if rpt:
-                        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-                        st.download_button(
-                            label="Download Audit Report (.docx)",
-                            data=rpt.read_bytes(),
-                            file_name=rpt.name,
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        )
-                else:
-                    st.success("Scan complete. View results in Gap Report.")
-            if rc != 0:
+            if rc == 0 and scan:
+                # Auto-generate report and cache bytes in session state
+                run_cmd(["-m", "src.report.generator",
+                         "--registry", "output/gap_registry.json"])
+                rpt = report_path()
+                st.session_state.scan_result    = scan
+                st.session_state.scan_file_name = uploaded.name
+                st.session_state.report_bytes   = rpt.read_bytes() if rpt else None
+                st.session_state.report_name    = rpt.name if rpt else None
+            elif rc == 0:
+                st.success("Scan complete. View results in Gap Report.")
+            else:
                 st.error("Scan failed.")
                 st.code(out, language="text")
+
+    # ── Results — rendered from session state, survive all reruns ────────
+    scan = st.session_state.scan_result
+    if scan:
+        crit  = sum(1 for f in scan.findings if f.severity.value == "CRITICAL")
+        maj   = sum(1 for f in scan.findings if f.severity.value == "MAJOR")
+        minor = sum(1 for f in scan.findings if f.severity.value == "MINOR")
+
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+        if crit > 0:
+            st.error(f"Scan complete — {scan.gaps_found} gap(s) identified, "
+                     f"including {crit} critical finding(s) requiring immediate attention.")
+        else:
+            st.success(f"Scan complete — {scan.gaps_found} gap(s) identified.")
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Gaps", scan.gaps_found)
+        c2.metric("Critical",   crit)
+        c3.metric("Major",      maj)
+        c4.metric("Minor",      minor)
+
+        # Download button — always visible once scan is done
+        if st.session_state.report_bytes:
+            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+            st.markdown('<p class="section-label">Audit Report</p>', unsafe_allow_html=True)
+            st.download_button(
+                label="Download Audit Report (.docx)",
+                data=st.session_state.report_bytes,
+                file_name=st.session_state.report_name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.markdown('<p class="section-label">Gap Findings</p>', unsafe_allow_html=True)
+
+        SEV_ORDER = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
+        for i, f in enumerate(
+            sorted(scan.findings,
+                   key=lambda x: (SEV_ORDER[x.severity.value], x.sop_clause)), 1
+        ):
+            st.markdown(gap_card(i, f), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
