@@ -397,6 +397,36 @@ def _write_cache(file_hash: str, sop_id: str, sop_file: str) -> None:
     _save_cache(cache)
 
 
+def _rebuild_master_registry() -> None:
+    """Merge all per-SOP gap_registry_*.json files into gap_registry.json.
+
+    scan_sop() (single-SOP CLI mode) only writes the per-SOP file, never the
+    master registry.  This helper bridges that gap so the report generator
+    always has a valid input file.
+    """
+    from datetime import datetime, timezone
+    from src.schemas import GapRegistry, SOPScanResult
+
+    per_sop_files = sorted(OUTPUT_DIR.glob("gap_registry_*.json"))
+    scans: list = []
+    for f in per_sop_files:
+        try:
+            scans.append(SOPScanResult.model_validate(json.loads(f.read_text())))
+        except Exception:
+            pass
+
+    if not scans:
+        return
+
+    registry = GapRegistry(
+        registry_timestamp=datetime.now(timezone.utc).isoformat(),
+        total_sops_scanned=len(scans),
+        total_gaps_found=sum(s.gaps_found for s in scans),
+        scans=scans,
+    )
+    REGISTRY_PATH.write_text(registry.model_dump_json(indent=2))
+
+
 def run_cmd(cmd: list[str]) -> tuple[int, str]:
     r = subprocess.run([sys.executable] + cmd, capture_output=True, text=True, cwd=str(BASE))
     return r.returncode, r.stdout + r.stderr
@@ -567,7 +597,6 @@ if page == "Scan SOP":
             if cache_hit:
                 scan = cached_scan
                 rc   = 0
-                st.info("Results loaded from cache — no API calls needed.")
             else:
                 st.markdown(
                     '<p class="section-label">Scan Progress</p>',
@@ -589,18 +618,26 @@ if page == "Scan SOP":
                 status_box.empty()
                 log_box.empty()
 
+                # Resolve scan from the per-SOP registry file the detector wrote
                 scan = None
                 if rc == 0:
-                    registry = load_registry()
-                    if registry:
-                        scan = next(
-                            (s for s in registry.scans if s.sop_file == uploaded.name), None
-                        )
+                    per_sop = OUTPUT_DIR / f"gap_registry_{save_path.stem.split('_')[0]}.json"
+                    # More robust: find by filename in master, or load per-SOP directly
+                    from src.schemas import SOPScanResult as _SSR
+                    for candidate in sorted(OUTPUT_DIR.glob("gap_registry_*.json")):
+                        try:
+                            s = _SSR.model_validate(json.loads(candidate.read_text()))
+                            if s.sop_file == uploaded.name:
+                                scan = s
+                                break
+                        except Exception:
+                            pass
                     if scan:
                         _write_cache(fhash, scan.sop_id, scan.sop_file)
 
             if rc == 0 and scan:
-                # Auto-generate report and cache bytes in session state
+                # Rebuild master registry (scan_sop CLI never writes it) then generate report
+                _rebuild_master_registry()
                 run_cmd(["-m", "src.report.generator",
                          "--registry", "output/gap_registry.json"])
                 rpt = report_path()
@@ -608,9 +645,7 @@ if page == "Scan SOP":
                 st.session_state.scan_file_name = uploaded.name
                 st.session_state.report_bytes   = rpt.read_bytes() if rpt else None
                 st.session_state.report_name    = rpt.name if rpt else None
-            elif rc == 0:
-                st.success("Scan complete. View results in Gap Report.")
-            else:
+            elif rc != 0:
                 st.error("Scan failed.")
                 st.code(out, language="text")
 
@@ -621,11 +656,12 @@ if page == "Scan SOP":
         maj   = sum(1 for f in scan.findings if f.severity.value == "MAJOR")
         minor = sum(1 for f in scan.findings if f.severity.value == "MINOR")
 
-        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.markdown('<p class="section-label">Scan Results</p>', unsafe_allow_html=True)
 
         if crit > 0:
-            st.error(f"Scan complete — {scan.gaps_found} gap(s) identified, "
-                     f"including {crit} critical finding(s) requiring immediate attention.")
+            st.error(f"**{scan.gaps_found} gap(s) identified** — {crit} critical finding(s) "
+                     f"require immediate attention.")
         else:
             st.success(f"Scan complete — {scan.gaps_found} gap(s) identified.")
 
@@ -636,17 +672,20 @@ if page == "Scan SOP":
         c3.metric("Major",      maj)
         c4.metric("Minor",      minor)
 
-        # Download button — always visible once scan is done
+        # ── Download report — pinned here, no page navigation needed ──
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.markdown('<p class="section-label">Audit Report</p>', unsafe_allow_html=True)
         if st.session_state.report_bytes:
-            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-            st.markdown('<p class="section-label">Audit Report</p>', unsafe_allow_html=True)
             st.download_button(
                 label="Download Audit Report (.docx)",
                 data=st.session_state.report_bytes,
                 file_name=st.session_state.report_name,
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
+        else:
+            st.caption("Report generation failed — run from the Gap Report page.")
 
+        # ── Gap finding cards ──────────────────────────────────────────
         st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
         st.markdown('<p class="section-label">Gap Findings</p>', unsafe_allow_html=True)
 
