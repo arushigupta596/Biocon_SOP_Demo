@@ -670,7 +670,21 @@ elif page == "Gap Report":
         unsafe_allow_html=True,
     )
 
-    if not REGISTRY_PATH.exists():
+    # Resolve report bytes: prefer session state (works on cloud / ephemeral FS),
+    # fall back to the file on disk from a previous run.
+    _rpt_bytes = st.session_state.get("report_bytes")
+    _rpt_name  = st.session_state.get("report_name")
+    _rpt_disk  = report_path()
+    if not _rpt_bytes and _rpt_disk:
+        _rpt_bytes = _rpt_disk.read_bytes()
+        _rpt_name  = _rpt_disk.name
+
+    # Resolve registry: session state scan + disk registry
+    _registry  = load_registry()
+    _ss_scan   = st.session_state.get("scan_result")
+    _has_data  = bool(_registry or _ss_scan)
+
+    if not _has_data:
         st.warning("No gap registry found. Upload and scan an SOP first.")
     else:
         col_btn, col_dl = st.columns([1, 2])
@@ -680,36 +694,47 @@ elif page == "Gap Report":
                     rc, out = run_cmd(["-m", "src.report.generator",
                                        "--registry", "output/gap_registry.json"])
                 if rc == 0:
+                    rpt = report_path()
+                    if rpt:
+                        st.session_state.report_bytes = rpt.read_bytes()
+                        st.session_state.report_name  = rpt.name
+                        _rpt_bytes = st.session_state.report_bytes
+                        _rpt_name  = st.session_state.report_name
                     st.success("Report generated.")
                 else:
                     st.error("Report generation failed.")
                     st.code(out, language="text")
 
-        rpt = report_path()
-        if rpt:
+        if _rpt_bytes:
             with col_dl:
                 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
                 st.download_button(
                     label="Download Audit Report (.docx)",
-                    data=rpt.read_bytes(),
-                    file_name=rpt.name,
+                    data=_rpt_bytes,
+                    file_name=_rpt_name or "gap_report.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-        registry = load_registry()
-        if registry:
-            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-            st.markdown('<p class="section-label">Report Summary</p>', unsafe_allow_html=True)
+        # Summary table — merge disk registry with any in-session scan
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        st.markdown('<p class="section-label">Report Summary</p>', unsafe_allow_html=True)
+
+        scans = list(_registry.scans) if _registry else []
+        # Add the in-session scan if it isn't already in the disk registry
+        if _ss_scan and not any(s.sop_id == _ss_scan.sop_id for s in scans):
+            scans.append(_ss_scan)
+
+        if scans:
             data = []
-            for scan in sorted(registry.scans, key=lambda s: s.sop_id):
-                crit  = sum(1 for f in scan.findings if f.severity.value == "CRITICAL")
-                maj   = sum(1 for f in scan.findings if f.severity.value == "MAJOR")
-                minor = sum(1 for f in scan.findings if f.severity.value == "MINOR")
+            for s in sorted(scans, key=lambda x: x.sop_id):
+                crit  = sum(1 for f in s.findings if f.severity.value == "CRITICAL")
+                maj   = sum(1 for f in s.findings if f.severity.value == "MAJOR")
+                minor = sum(1 for f in s.findings if f.severity.value == "MINOR")
                 data.append({
-                    "SOP ID":          scan.sop_id,
-                    "File":            scan.sop_file,
-                    "Clauses Scanned": scan.total_clauses_scanned,
-                    "Total Gaps":      scan.gaps_found,
+                    "SOP ID":          s.sop_id,
+                    "File":            s.sop_file,
+                    "Clauses Scanned": s.total_clauses_scanned,
+                    "Total Gaps":      s.gaps_found,
                     "Critical":        crit,
                     "Major":           maj,
                     "Minor":           minor,
