@@ -281,4 +281,37 @@ Repeat scans of previously uploaded files cost **$0.00** due to content-hash cac
 
 ---
 
+## Ingested Files for Gap Analysis
+
+### Regulatory Corpus — Reference Documents (vector-indexed)
+
+These PDFs are chunked at 512 tokens (64-token overlap), embedded with `text-embedding-3-large`, and stored in ChromaDB. During a scan, the top-8 most semantically relevant chunks are retrieved per SOP clause and passed as regulatory context to Claude.
+
+| File | Regulation | Scope | Pages | Chunks Indexed |
+|------|-----------|-------|-------|---------------|
+| `21_cfr_part_211.pdf` | 21 CFR Part 211 — FDA Current Good Manufacturing Practice | GMP requirements for finished pharmaceuticals: equipment, records, lab controls, batch review | 29 | 42 |
+| `21_cfr_part_600_610.pdf` | 21 CFR Part 600–610 — FDA Biologics Regulations | Licensing, manufacturing, and testing requirements specific to biological products | 25 | 38 |
+| `ich_q11.pdf` | ICH Q11 — Development and Manufacture of Drug Substances (Biologics) | CQA definition, control strategy, comparability for biotech drug substances | 30 | 37 |
+| `ich_q10.pdf` | ICH Q10 — Pharmaceutical Quality System | Quality system elements, process performance, change management | 21 | 19 |
+| `ich_q5e.pdf` | ICH Q5E — Comparability of Biotechnological/Biological Products | Comparability protocols after manufacturing changes for biologics | 16 | 18 |
+
+**Total indexed:** 154 chunks across 121 pages of regulatory text
+
+---
+
+### Biocon SOPs — Documents Scanned for Gaps
+
+These are the Biocon Biologics SOP documents that the engine analyses against the regulatory corpus. Each document is parsed into numbered clauses; every clause is individually assessed.
+
+| File | SOP ID | Domain | Clauses Scanned | Gaps Found |
+|------|--------|--------|----------------|-----------|
+| `BC-MFG-UC-047_Upstream_Cell_Culture_mAb.docx` | BC-MFG-UC-047 | Upstream Cell Culture — mAb manufacturing process control and CQA management | 14 | 8 |
+| `BC-QC-BR-012_Batch_Record_Review.docx` | BC-QC-BR-012 | Quality Control — batch record review procedures, OOS handling, timelines | 11 | 22 |
+| `BC-RA-IM-008_Immunogenicity_Risk_Assessment.docx` | BC-RA-IM-008 | Regulatory Affairs — immunogenicity risk assessment, ADA testing, patient impact | 11 | 11 |
+| `BC-AN-MV-031_Analytical_Method_Validation_ProteinA_HPLC.docx` | BC-AN-MV-031 | Analytical — Protein A HPLC method validation, system suitability, method transfer | 15 | 14 |
+
+**Total across all SOPs:** 51 clauses scanned, 55 gaps identified
+
+---
+
 *Built by EMB Global for Biocon Biologics — April 2026*
