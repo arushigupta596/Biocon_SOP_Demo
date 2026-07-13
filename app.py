@@ -509,11 +509,10 @@ def gap_card(i: int, f) -> str:
 
 with st.sidebar:
     st.markdown("""
-    <div style="background:#001e3c;padding:24px 20px 20px;margin:-1rem -1rem 0;
+    <div style="background:#001e3c;padding:18px 20px;margin:-1rem -1rem 0;
                 border-bottom:1px solid rgba(112,169,220,0.25);">
-        <div style="font-size:17px;font-weight:800;color:#fff;letter-spacing:0.3px;">BIOCON</div>
         <div style="font-size:9px;font-weight:600;letter-spacing:2.5px;
-                    text-transform:uppercase;color:#70A9DC;margin-top:3px;">
+                    text-transform:uppercase;color:#70A9DC;">
             SOP Compliance Engine
         </div>
     </div>""", unsafe_allow_html=True)
