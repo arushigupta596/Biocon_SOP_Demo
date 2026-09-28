@@ -35,8 +35,18 @@ output/gap_report_*.docx
 output/corpus_manifest.json
 output/scan_cache.json
 
+# Per-session working directories (one per browser session, swept on a TTL)
+output/sessions/
+output/audit/
+sops/uploads/
+
 # Keep the output directory skeleton
 !output/.gitkeep
+
+# The baseline registry IS committed: the pre-demo test page needs it on a
+# cold deploy, and without it pytest skips everything and reports green.
+!output/baseline/
+!output/baseline/**
 
 # Raw data folder (not needed in deployment)
 Data/

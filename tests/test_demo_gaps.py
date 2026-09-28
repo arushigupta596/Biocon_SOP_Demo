@@ -216,10 +216,30 @@ class TestGap4SystemSuitability:
 # ---------------------------------------------------------------------------
 
 class TestRegistryIntegrity:
-    def test_four_sops_scanned(self, gap_registry) -> None:
-        assert gap_registry.total_sops_scanned == 4, (
-            f"Expected 4 SOPs scanned, got {gap_registry.total_sops_scanned}"
+    def test_demo_sops_present(self, gap_registry) -> None:
+        """The four demo SOPs were scanned.
+
+        Replaces an earlier `total_sops_scanned == 4` assertion. That encoded
+        the wrong intent: it meant "the four demo SOPs were scanned" but it
+        said "nobody has ever scanned anything else", so any extra SOP in the
+        registry broke the app's own test page.
+        """
+        from tests.conftest import DEMO_SOP_IDS
+        scanned = {s.sop_id for s in gap_registry.scans}
+        missing = DEMO_SOP_IDS - scanned
+        assert not missing, f"Demo SOPs missing from registry: {sorted(missing)}"
+
+    def test_registry_counts_are_self_consistent(self, gap_registry) -> None:
+        """Header totals must agree with the body. Strictly stronger than == 4."""
+        assert gap_registry.total_sops_scanned == len(gap_registry.scans)
+        assert gap_registry.total_gaps_found == sum(
+            s.gaps_found for s in gap_registry.scans
         )
+        for s in gap_registry.scans:
+            assert s.gaps_found == len(s.findings), (
+                f"{s.sop_id}: gaps_found={s.gaps_found} but "
+                f"{len(s.findings)} findings present"
+            )
 
     def test_minimum_gap_count(self, gap_registry) -> None:
         assert gap_registry.total_gaps_found >= 4, (
@@ -250,3 +270,51 @@ class TestRegistryIntegrity:
             assert f.gap_description.strip(), (
                 f"Empty gap_description in {f.sop_id} {f.sop_clause}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Guardrail integrity — added with guardrails v1.0
+# ---------------------------------------------------------------------------
+
+class TestGuardrailIntegrity:
+    def test_guardrails_were_applied(self, gap_registry) -> None:
+        assert gap_registry.guardrails_version is not None, (
+            "Registry has no guardrails_version — it was produced without "
+            "citation grounding or coverage accounting."
+        )
+
+    def test_verified_findings_are_actually_grounded(
+        self, all_findings: list[GapResult]
+    ) -> None:
+        """A finding marked VERIFIED must trace to a retrieved chunk."""
+        from src.gap_engine.guardrails import EXCERPT_CONTAINMENT_THRESHOLD
+        for f in all_findings:
+            if f.is_flagged:
+                continue
+            assert f.grounding_score is not None, (
+                f"{f.sop_id} {f.sop_clause} is VERIFIED but has no grounding score"
+            )
+            assert f.grounding_score >= EXCERPT_CONTAINMENT_THRESHOLD, (
+                f"{f.sop_id} {f.sop_clause} is VERIFIED but scored "
+                f"{f.grounding_score:.2f}"
+            )
+
+    def test_flagged_findings_state_a_reason(
+        self, all_findings: list[GapResult]
+    ) -> None:
+        for f in all_findings:
+            if f.is_flagged:
+                assert f.verification_flags, (
+                    f"{f.sop_id} {f.sop_clause} is flagged but lists no reason"
+                )
+
+    def test_no_clause_left_unscanned(self, gap_registry) -> None:
+        """Pre-demo gate: a degraded run must not pass as a clean one."""
+        offenders = {
+            s.sop_id: s.unscanned_count
+            for s in gap_registry.scans if s.unscanned_count
+        }
+        assert not offenders, (
+            f"Unscanned clauses present: {offenders}. Coverage is incomplete; "
+            f"re-run the scan before the demo."
+        )

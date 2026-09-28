@@ -5,6 +5,18 @@ and calls Claude via OpenRouter to identify compliance gaps.
 Usage:
     python -m src.gap_engine.detector --sop sops/BC-MFG-UC-047.docx
     python -m src.gap_engine.detector --all --sops sops/ [--workers 4]
+
+GUARDRAIL CONTRACT
+------------------
+A clause never silently becomes "compliant". Every failure path produces a
+typed UnscannedClause record instead of an empty finding list, so the absence
+of a finding means one of exactly two things: the model assessed the clause and
+found nothing, or the clause is listed as UNSCANNED.
+
+Exit codes:
+    0  scan completed, including a partially degraded one (app.py discards all
+       results on a non-zero code, so degradation must not be signalled here)
+    2  nothing at all could be analysed, or a fatal ScanAbort
 """
 from __future__ import annotations
 
@@ -12,91 +24,91 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
+import sys
+import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-import docx
-import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 from openai import OpenAI
 from pydantic import ValidationError
 
-from src.schemas import GapRegistry, GapResult, SOPScanResult
+from src.gap_engine import guardrails as gr
+from src.gap_engine.budget import BudgetExceeded, ScanAbort, ScanBudget
+from src.gap_engine.parsing import ParseError, SOPClause, parse_clauses
+from src.gap_engine.prompts import (
+    CLAUSE_CHAR_LIMIT,
+    COLLECTION_NAME,
+    EMBEDDING_MODEL,
+    HEADING_CHAR_LIMIT,
+    MAX_TOKENS,
+    MAX_TOKENS_RETRY,
+    MIN_RELEVANCE_SCORE,
+    MODEL,
+    OPENROUTER_BASE_URL,
+    REPAIR_NUDGE,
+    RETRIEVAL_QUERY_CHARS,
+    SECTION_ID_CHAR_LIMIT,
+    SYSTEM_PROMPT,
+    TOP_K,
+    USER_PROMPT_TEMPLATE,
+)
+from src.schemas import (
+    GUARDRAILS_VERSION,
+    GapRegistry,
+    GapResult,
+    SOPScanResult,
+    UnscannedClause,
+    UnscannedReason,
+    VerificationFlag,
+    VerificationStatus,
+)
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
-COLLECTION_NAME = "regulatory_corpus"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-MODEL = "anthropic/claude-sonnet-4-5"
-TOP_K = 8
-MIN_RELEVANCE_SCORE = 0.30
-
-# ---------------------------------------------------------------------------
-# System prompt — enforces JSON-only output
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """\
-You are a regulatory compliance specialist for pharmaceutical biologics manufacturing.
-Your task: analyse a single SOP clause against provided regulatory context, identify
-compliance gaps, and return ONLY a valid JSON array of gap findings.
-
-SEVERITY DEFINITIONS:
-- CRITICAL: Missing required element that will cause regulatory non-conformance at FDA/EMA inspection
-- MAJOR: Deficient element that is likely to be cited at inspection
-- MINOR: Improvement recommended; low regulatory risk; not typically cited
-
-OUTPUT CONTRACT — you MUST return ONLY a raw JSON array, with no markdown, no prose, no code fences.
-Schema for each element in the array:
-{
-  "sop_clause":         "<section reference, e.g. §7.3>",
-  "sop_clause_text":    "<verbatim excerpt of the SOP clause text that is deficient>",
-  "regulation_ref":     "<citation, e.g. EMA CHMP/437/04 Rev1 §5.2.3>",
-  "regulation_excerpt": "<verbatim excerpt from the regulatory text establishing the requirement>",
-  "gap_description":    "<plain-English description of the compliance gap>",
-  "severity":           "<CRITICAL | MAJOR | MINOR>",
-  "remediation":        "<actionable steps to close the gap>",
-  "confidence":         <float 0.0-1.0>
-}
-
-If no gaps are found for this clause, return an empty array: []
-Do NOT invent gaps. Do NOT cite regulations not present in the provided context.
-Confidence should be ~0.90 if the regulation explicitly states the requirement,
-~0.70 if the regulation implies it, ~0.60 if it is a reasonable interpretation.
-"""
-
-USER_PROMPT_TEMPLATE = """\
-SOP ID: {sop_id}
-SOP CLAUSE: {section_id} — {heading}
-
---- SOP CLAUSE TEXT ---
-{clause_body}
-
---- REGULATORY CONTEXT (retrieved from corpus) ---
-{regulatory_context}
-
-Identify ALL compliance gaps in this SOP clause relative to the regulatory requirements above.
-Return ONLY the JSON array of gap findings as specified. No other text.
-"""
+MAX_ATTEMPTS = 3
+SOP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Per-clause outcome
 # ---------------------------------------------------------------------------
+
+ClauseStatus = Literal["ANALYSED", "NO_GAPS", "UNSCANNED", "NO_CONTEXT", "SKIPPED_CAP"]
+
 
 @dataclass
-class SOPClause:
+class ClauseOutcome:
     section_id: str
     heading: str
-    body: str
+    status: ClauseStatus
+    findings: list[GapResult] = field(default_factory=list)
+    reason: Optional[UnscannedReason] = None
+    detail: str = ""
+    attempts: int = 0
+
+    @property
+    def is_unscanned(self) -> bool:
+        return self.status in ("UNSCANNED", "NO_CONTEXT", "SKIPPED_CAP")
+
+
+@dataclass
+class LLMOutcome:
+    items: Optional[list]
+    reason: Optional[UnscannedReason]
+    detail: str = ""
+    attempts: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -109,12 +121,27 @@ class SOPGapDetector:
         chroma_path: Path,
         collection_name: str = COLLECTION_NAME,
         top_k: int = TOP_K,
+        budget: Optional[ScanBudget] = None,
+        enable_guardrails: bool = True,
     ) -> None:
         self.top_k = top_k
+        self.budget = budget or ScanBudget()
+        self.enable_guardrails = enable_guardrails
+
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ScanAbort(
+                "OPENROUTER_API_KEY is not set. The scanner cannot start."
+            )
+
         embeddings = OpenAIEmbeddings(
-            model="openai/text-embedding-3-large",
-            openai_api_key=os.environ["OPENROUTER_API_KEY"],
-            openai_api_base="https://openrouter.ai/api/v1",
+            model=EMBEDDING_MODEL,
+            openai_api_key=api_key,
+            openai_api_base=OPENROUTER_BASE_URL,
+            # The embedding call was previously as unbounded as the completion
+            # call, and equally capable of hanging a live demo.
+            timeout=self.budget.per_call_timeout_s,
+            max_retries=2,
         )
         self.vectorstore = Chroma(
             collection_name=collection_name,
@@ -122,69 +149,123 @@ class SOPGapDetector:
             persist_directory=str(chroma_path),
         )
         self.client = OpenAI(
-            api_key=os.environ["OPENROUTER_API_KEY"],
+            api_key=api_key,
             base_url=OPENROUTER_BASE_URL,
+            timeout=self.budget.per_call_timeout_s,
+            # Must be 0: the SDK's own retries would multiply against ours and
+            # blow through the scan deadline.
+            max_retries=0,
         )
 
     # ------------------------------------------------------------------
     # Public: scan a single SOP
     # ------------------------------------------------------------------
 
-    def scan_sop(self, sop_path: Path) -> SOPScanResult:
+    def scan_sop(
+        self,
+        sop_path: Path,
+        out_dir: Path = Path("output"),
+        max_clauses: int = 0,
+    ) -> SOPScanResult:
         sop_id = self._extract_sop_id(sop_path)
         logger.info("Scanning %s (%s) …", sop_path.name, sop_id)
 
-        if sop_path.suffix.lower() == ".pdf":
-            clauses = self._parse_sop_pdf(sop_path)
-        else:
-            clauses = self._parse_sop(sop_path)
+        self._check_file_limits(sop_path)
+
+        try:
+            clauses = parse_clauses(sop_path)
+        except ParseError as exc:
+            raise ScanAbort(str(exc)) from exc
         logger.info("  %d clauses parsed", len(clauses))
 
-        all_findings: list[GapResult] = []
-        for clause in clauses:
-            reg_chunks = self._retrieve_regulatory_context(clause)
-            if not reg_chunks:
+        if not clauses:
+            raise ScanAbort(
+                f"No numbered clauses found in {sop_path.name}. The engine needs "
+                f"sections such as '7.3 Comparability'."
+            )
+
+        cap = max_clauses or self.budget.max_clauses_per_sop
+        analysed_clauses, capped_clauses = clauses[:cap], clauses[cap:]
+        if capped_clauses:
+            logger.warning(
+                "Clause cap reached: analysing %d of %d clauses; %d marked UNSCANNED",
+                len(analysed_clauses), len(clauses), len(capped_clauses),
+            )
+
+        outcomes: list[ClauseOutcome] = []
+        budget_stop: Optional[BudgetExceeded] = None
+
+        for clause in analysed_clauses:
+            if budget_stop is None:
+                try:
+                    self.budget.check_deadline()
+                except BudgetExceeded as exc:
+                    budget_stop = exc
+                    logger.error(
+                        "Budget exceeded (%s); remaining clauses marked UNSCANNED. %s",
+                        exc.reason.value, self.budget.snapshot(),
+                    )
+            if budget_stop is not None:
+                outcomes.append(ClauseOutcome(
+                    clause.section_id, clause.heading, "SKIPPED_CAP",
+                    reason=budget_stop.reason, detail=budget_stop.detail,
+                ))
                 continue
-            findings = self._detect_gaps(sop_id, clause, reg_chunks)
-            all_findings.extend(findings)
-            if findings:
-                logger.info(
-                    "  %s %s — %d gap(s) found", sop_id, clause.section_id, len(findings)
+
+            try:
+                outcomes.append(self._analyse_clause(sop_id, clause))
+            except BudgetExceeded as exc:
+                budget_stop = exc
+                logger.error(
+                    "Budget exceeded (%s); remaining clauses marked UNSCANNED. %s",
+                    exc.reason.value, self.budget.snapshot(),
                 )
+                outcomes.append(ClauseOutcome(
+                    clause.section_id, clause.heading, "SKIPPED_CAP",
+                    reason=exc.reason, detail=exc.detail,
+                ))
 
-        result = SOPScanResult(
-            sop_id=sop_id,
-            sop_file=sop_path.name,
-            scan_timestamp=datetime.now(timezone.utc).isoformat(),
-            total_clauses_scanned=len(clauses),
-            gaps_found=len(all_findings),
-            findings=all_findings,
+        for clause in capped_clauses:
+            outcomes.append(ClauseOutcome(
+                clause.section_id, clause.heading, "SKIPPED_CAP",
+                reason=UnscannedReason.CLAUSE_CAP,
+                detail=f"clause cap of {cap} reached",
+            ))
+
+        result = self._build_result(sop_id, sop_path, clauses, outcomes)
+        self._write_result(result, out_dir, sop_id)
+
+        logger.info(
+            "  %s — %d/%d clauses analysed, %d UNSCANNED%s, %d gaps (%d flagged)",
+            sop_id, result.analysed, result.total_clauses_scanned,
+            result.unscanned_count,
+            f" ({self._fmt_counts(result.error_counts)})" if result.error_counts else "",
+            result.gaps_found, result.flagged_findings_count,
         )
-
-        # Write per-SOP output
-        out_dir = Path("output")
-        out_dir.mkdir(exist_ok=True)
-        per_sop_path = out_dir / f"gap_registry_{sop_id}.json"
-        per_sop_path.write_text(result.model_dump_json(indent=2))
-        logger.info("  Written: %s (%d gaps)", per_sop_path, len(all_findings))
-
         return result
 
     # ------------------------------------------------------------------
     # Public: scan all SOPs in a directory
     # ------------------------------------------------------------------
 
-    def scan_all(self, sops_dir: Path, workers: int = 4) -> GapRegistry:
-        sop_files = sorted(
-            [*sops_dir.glob("*.docx"), *sops_dir.glob("*.pdf")]
-        )
+    def scan_all(
+        self,
+        sops_dir: Path,
+        workers: int = 4,
+        out_dir: Path = Path("output"),
+        max_clauses: int = 0,
+    ) -> GapRegistry:
+        sop_files = sorted([*sops_dir.glob("*.docx"), *sops_dir.glob("*.pdf")])
         if not sop_files:
-            raise FileNotFoundError(f"No .docx or .pdf files found in {sops_dir}")
+            raise ScanAbort(f"No .docx or .pdf files found in {sops_dir}")
         logger.info("Found %d SOP files in %s", len(sop_files), sops_dir)
 
         results: list[SOPScanResult] = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(self.scan_sop, f): f for f in sop_files}
+            futures = {
+                executor.submit(self.scan_sop, f, out_dir, max_clauses): f
+                for f in sop_files
+            }
             for future in as_completed(futures):
                 path = futures[future]
                 try:
@@ -192,126 +273,289 @@ class SOPGapDetector:
                 except Exception as exc:
                     logger.error("Scan failed for %s: %s", path.name, exc)
 
-        registry = GapRegistry(
-            registry_timestamp=datetime.now(timezone.utc).isoformat(),
-            total_sops_scanned=len(results),
-            total_gaps_found=sum(r.gaps_found for r in results),
-            scans=results,
-        )
-
-        out_path = Path("output") / "gap_registry.json"
-        out_path.parent.mkdir(exist_ok=True)
+        registry = self._build_registry(results)
+        out_path = out_dir / "gap_registry.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(registry.model_dump_json(indent=2))
         logger.info(
-            "Master registry written to %s (%d gaps across %d SOPs)",
+            "Master registry written to %s (%d gaps across %d SOPs, "
+            "%d unscanned clause(s), %d finding(s) need verification)",
             out_path, registry.total_gaps_found, registry.total_sops_scanned,
+            registry.total_unscanned_clauses, registry.total_flagged_findings,
         )
         return registry
 
     # ------------------------------------------------------------------
-    # SOP parsing
+    # Per-clause analysis
     # ------------------------------------------------------------------
 
-    HEADING_STYLES = frozenset({
-        "Heading 1", "Heading 2", "Heading 3",
-        "heading 1", "heading 2", "heading 3",
-    })
-    SECTION_RE = re.compile(r'^(\d+(?:\.\d+)*\.?)\s+(.+)$')
+    def _analyse_clause(self, sop_id: str, clause: SOPClause) -> ClauseOutcome:
+        # --- sanitise untrusted document text before it touches the prompt --
+        if self.enable_guardrails:
+            body, hits = gr.sanitise_untrusted(clause.body)
+            heading, h_hits = gr.sanitise_untrusted(clause.heading)
+            section_id, s_hits = gr.sanitise_untrusted(clause.section_id)
+            hits += h_hits + s_hits
+        else:
+            body, heading, section_id, hits = clause.body, clause.heading, clause.section_id, 0
 
-    def _parse_sop(self, docx_path: Path) -> list[SOPClause]:
-        doc = docx.Document(str(docx_path))
-        clauses: list[SOPClause] = []
-        current_section: Optional[str] = None
-        current_heading: Optional[str] = None
-        body_paras: list[str] = []
-
-        def flush() -> None:
-            if current_heading and body_paras:
-                clauses.append(SOPClause(
-                    section_id=current_section or "§?",
-                    heading=current_heading,
-                    body=" ".join(body_paras),
-                ))
-
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if not text:
-                continue
-
-            style_name = para.style.name if para.style else ""
-            is_heading = (
-                style_name in self.HEADING_STYLES
-                or bool(self.SECTION_RE.match(text))
+        clause_flags: list[str] = []
+        if hits:
+            clause_flags.append(VerificationFlag.INJECTION_SUSPECTED.value)
+            logger.warning(
+                "  %s %s — %d injection-shaped pattern(s) removed from clause text",
+                sop_id, clause.section_id, hits,
+            )
+        if len(body) > CLAUSE_CHAR_LIMIT:
+            clause_flags.append(VerificationFlag.CLAUSE_TRUNCATED.value)
+            logger.warning(
+                "  %s %s — clause is %d chars, analysing first %d",
+                sop_id, clause.section_id, len(body), CLAUSE_CHAR_LIMIT,
             )
 
-            if is_heading:
-                flush()
-                m = self.SECTION_RE.match(text)
-                if m:
-                    num = m.group(1).rstrip(".")
-                    current_section = f"§{num}"
-                    current_heading = m.group(2).strip()
-                else:
-                    current_section = "§?"
-                    current_heading = text
-                body_paras = []
-            else:
-                body_paras.append(text)
+        # --- retrieval ------------------------------------------------------
+        try:
+            reg_chunks = self._retrieve_regulatory_context(heading, body)
+        except Exception as exc:
+            logger.error("  Retrieval failed for %s: %s", clause.section_id, exc)
+            return ClauseOutcome(
+                clause.section_id, clause.heading, "UNSCANNED",
+                reason=UnscannedReason.RETRIEVAL_FAILED, detail=str(exc)[:200],
+            )
 
-        flush()
-        return clauses
+        if not reg_chunks:
+            # Neither compliance nor an error: no regulatory basis was retrieved.
+            return ClauseOutcome(
+                clause.section_id, clause.heading, "NO_CONTEXT",
+                reason=UnscannedReason.NO_REGULATORY_CONTEXT,
+                detail=f"no chunk scored >= {MIN_RELEVANCE_SCORE}",
+            )
 
-    def _parse_sop_pdf(self, pdf_path: Path) -> list[SOPClause]:
-        """Parse a PDF SOP into clauses using regex section detection."""
-        doc = fitz.open(str(pdf_path))
-        lines: list[str] = []
-        for page in doc:
-            for line in page.get_text().splitlines():
-                line = line.strip()
-                if line:
-                    lines.append(line)
+        # --- prompt ---------------------------------------------------------
+        reg_context = "\n\n".join(
+            f"[SOURCE {i + 1}] {c['regulation_ref']} (relevance: {c['score']:.2f})\n{c['text']}"
+            for i, c in enumerate(reg_chunks)
+        )
+        user_msg = USER_PROMPT_TEMPLATE.format(
+            sop_id=sop_id,
+            section_id=section_id[:SECTION_ID_CHAR_LIMIT],
+            heading=heading[:HEADING_CHAR_LIMIT],
+            clause_body=body[:CLAUSE_CHAR_LIMIT],
+            regulatory_context=reg_context,
+        )
 
-        clauses: list[SOPClause] = []
-        current_section: Optional[str] = None
-        current_heading: Optional[str] = None
-        body_lines: list[str] = []
+        llm = self._call_llm(sop_id, clause.section_id, user_msg)
+        if llm.items is None:
+            return ClauseOutcome(
+                clause.section_id, clause.heading, "UNSCANNED",
+                reason=llm.reason or UnscannedReason.API_ERROR,
+                detail=llm.detail, attempts=llm.attempts,
+            )
 
-        def flush() -> None:
-            if current_heading and body_lines:
-                clauses.append(SOPClause(
-                    section_id=current_section or "§?",
-                    heading=current_heading,
-                    body=" ".join(body_lines),
-                ))
+        # --- validate + verify ---------------------------------------------
+        findings: list[GapResult] = []
+        invalid = 0
+        for item in llm.items:
+            if not isinstance(item, dict):
+                invalid += 1
+                continue
+            coerced, coerce_flags = (
+                gr.coerce_item(item) if self.enable_guardrails else (dict(item), [])
+            )
+            coerced["sop_id"] = sop_id
+            try:
+                finding = GapResult.model_validate(coerced)
+            except ValidationError as exc:
+                invalid += 1
+                logger.warning(
+                    "  Schema validation failed for %s %s: %s",
+                    sop_id, clause.section_id, str(exc)[:200],
+                )
+                continue
 
-        for line in lines:
-            m = self.SECTION_RE.match(line)
-            if m:
-                flush()
-                num = m.group(1).rstrip(".")
-                current_section = f"§{num}"
-                current_heading = m.group(2).strip()
-                body_lines = []
-            else:
-                body_lines.append(line)
+            if self.enable_guardrails:
+                v = gr.verify_finding(
+                    finding, clause.body, clause.section_id, reg_chunks,
+                    extra_flags=clause_flags + coerce_flags,
+                )
+                finding.verification_status = v.status
+                finding.verification_flags = v.flags
+                finding.grounding_score = v.grounding_score
+                finding.grounded_source_file = v.grounded_source_file
+            findings.append(finding)
 
-        flush()
-        return clauses
+        # Only a total validation wipe demotes the clause. A partly-good clause
+        # must not be misreported as unassessed.
+        if invalid and not findings and llm.items:
+            return ClauseOutcome(
+                clause.section_id, clause.heading, "UNSCANNED",
+                reason=UnscannedReason.SCHEMA_INVALID,
+                detail=f"{invalid} item(s) failed schema validation",
+                attempts=llm.attempts,
+            )
+
+        if findings:
+            flagged = sum(1 for f in findings if f.is_flagged)
+            logger.info(
+                "  %s %s — %d gap(s) found%s",
+                sop_id, clause.section_id, len(findings),
+                f", {flagged} need verification" if flagged else "",
+            )
+            return ClauseOutcome(
+                clause.section_id, clause.heading, "ANALYSED",
+                findings=findings, attempts=llm.attempts,
+            )
+
+        return ClauseOutcome(
+            clause.section_id, clause.heading, "NO_GAPS", attempts=llm.attempts,
+        )
+
+    # ------------------------------------------------------------------
+    # LLM call with retry, truncation and refusal handling
+    # ------------------------------------------------------------------
+
+    def _call_llm(self, sop_id: str, section_id: str, user_msg: str) -> LLMOutcome:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ]
+        max_tokens = MAX_TOKENS
+        last_reason = UnscannedReason.API_ERROR
+        last_detail = ""
+        attempt = 0
+
+        while attempt < MAX_ATTEMPTS:
+            attempt += 1
+            self.budget.check_deadline()
+            self.budget.reserve_call()
+
+            try:
+                response = self.client.chat.completions.create(
+                    model=MODEL,
+                    max_tokens=max_tokens,
+                    temperature=0,          # CLAUDE.md rule 5: deterministic
+                    messages=messages,
+                    timeout=self.budget.per_call_timeout_s,
+                )
+            except Exception as exc:
+                kind = type(exc).__name__
+                # A bad or expired key is the highest-probability demo failure,
+                # and previously produced "successful scan, 0 gaps". Be loud.
+                if kind in ("AuthenticationError", "PermissionDeniedError"):
+                    raise ScanAbort(
+                        f"OpenRouter rejected the API key ({kind}). "
+                        f"Check OPENROUTER_API_KEY."
+                    ) from exc
+                if kind == "BadRequestError":
+                    return LLMOutcome(None, UnscannedReason.API_ERROR,
+                                      str(exc)[:200], attempt)
+
+                last_reason = self._classify_error(kind, exc)
+                last_detail = f"{kind}: {exc}"[:200]
+                logger.warning(
+                    "  %s %s — attempt %d/%d failed (%s)",
+                    sop_id, section_id, attempt, MAX_ATTEMPTS, kind,
+                )
+                if attempt < MAX_ATTEMPTS and self._backoff(attempt, exc):
+                    continue
+                return LLMOutcome(None, last_reason, last_detail, attempt)
+
+            choices = getattr(response, "choices", None)
+            if not choices:
+                last_reason, last_detail = UnscannedReason.API_ERROR, "no choices returned"
+                if attempt < MAX_ATTEMPTS and self._backoff(attempt, None):
+                    continue
+                return LLMOutcome(None, last_reason, last_detail, attempt)
+
+            choice = choices[0]
+            finish = getattr(choice, "finish_reason", None)
+
+            # Truncated JSON must never be parsed — a half-object can validate
+            # into a finding that misquotes the regulation.
+            if finish in ("length", "max_tokens"):
+                if max_tokens < MAX_TOKENS_RETRY and attempt < MAX_ATTEMPTS:
+                    logger.warning(
+                        "  %s %s — response truncated, retrying at %d tokens",
+                        sop_id, section_id, MAX_TOKENS_RETRY,
+                    )
+                    max_tokens = MAX_TOKENS_RETRY
+                    continue
+                return LLMOutcome(None, UnscannedReason.TRUNCATED_RESPONSE,
+                                  f"finish_reason={finish}", attempt)
+
+            # Checked BEFORE .strip(): content is None on a refusal, and the
+            # resulting AttributeError used to abort the whole SOP scan.
+            content = getattr(getattr(choice, "message", None), "content", None)
+            if content is None or not str(content).strip():
+                if finish == "content_filter":
+                    return LLMOutcome(None, UnscannedReason.MODEL_REFUSAL,
+                                      "content filtered", attempt)
+                last_reason, last_detail = UnscannedReason.MODEL_REFUSAL, "empty content"
+                if attempt < MAX_ATTEMPTS and self._backoff(attempt, None):
+                    continue
+                return LLMOutcome(None, last_reason, last_detail, attempt)
+
+            items, how = gr.extract_json_array(str(content))
+            if items is not None:
+                return LLMOutcome(items, None, how, attempt)
+
+            logger.warning(
+                "  %s %s — reply was not a JSON array (%s): %s",
+                sop_id, section_id, how, str(content)[:200],
+            )
+            if attempt < MAX_ATTEMPTS:
+                messages = messages + [
+                    {"role": "assistant", "content": str(content)[:2000]},
+                    {"role": "user", "content": REPAIR_NUDGE},
+                ]
+                continue
+            return LLMOutcome(None, UnscannedReason.UNPARSEABLE_RESPONSE,
+                              str(content)[:200], attempt)
+
+        return LLMOutcome(None, last_reason, last_detail, attempt)
+
+    @staticmethod
+    def _classify_error(kind: str, exc: Exception) -> UnscannedReason:
+        if "RateLimit" in kind:
+            return UnscannedReason.RATE_LIMITED
+        if "Timeout" in kind:
+            return UnscannedReason.TIMEOUT
+        status = getattr(exc, "status_code", None)
+        if status == 429:
+            return UnscannedReason.RATE_LIMITED
+        if status == 408:
+            return UnscannedReason.TIMEOUT
+        return UnscannedReason.API_ERROR
+
+    def _backoff(self, attempt: int, exc: Optional[Exception]) -> bool:
+        """Sleep before the next attempt. False means the deadline forbids it."""
+        delay = min(2 * (2 ** (attempt - 1)), 20) + random.uniform(0, 0.5)
+
+        retry_after = None
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers:
+            try:
+                retry_after = float(headers.get("Retry-After") or headers.get("retry-after"))
+            except (TypeError, ValueError):
+                retry_after = None
+        if retry_after:
+            delay = max(delay, min(retry_after, 30.0))
+
+        if delay >= self.budget.remaining_seconds():
+            return False
+        time.sleep(delay)
+        return True
 
     # ------------------------------------------------------------------
     # RAG retrieval
     # ------------------------------------------------------------------
 
-    def _retrieve_regulatory_context(self, clause: SOPClause) -> list[dict]:
-        query = f"{clause.heading}: {clause.body[:400]}"
-        try:
-            results = self.vectorstore.similarity_search_with_relevance_scores(
-                query=query, k=self.top_k
-            )
-        except Exception as exc:
-            logger.warning("Retrieval failed for clause %s: %s", clause.section_id, exc)
-            return []
-
+    def _retrieve_regulatory_context(self, heading: str, body: str) -> list[dict]:
+        query = f"{heading}: {body[:RETRIEVAL_QUERY_CHARS]}"
+        results = self.vectorstore.similarity_search_with_relevance_scores(
+            query=query, k=self.top_k
+        )
         chunks = []
         for doc_obj, score in results:
             if score < MIN_RELEVANCE_SCORE:
@@ -325,99 +569,131 @@ class SOPGapDetector:
         return chunks
 
     # ------------------------------------------------------------------
-    # Claude gap detection via OpenRouter
+    # Aggregation
     # ------------------------------------------------------------------
 
-    def _detect_gaps(
+    def _build_result(
         self,
         sop_id: str,
-        clause: SOPClause,
-        reg_chunks: list[dict],
-    ) -> list[GapResult]:
-        if not reg_chunks:
-            return []
+        sop_path: Path,
+        clauses: list[SOPClause],
+        outcomes: list[ClauseOutcome],
+    ) -> SOPScanResult:
+        findings = [f for o in outcomes for f in o.findings]
+        unscanned = [
+            UnscannedClause(
+                section_id=o.section_id, heading=o.heading,
+                reason=o.reason or UnscannedReason.API_ERROR,
+                detail=o.detail, attempts=o.attempts,
+            )
+            for o in outcomes if o.is_unscanned
+        ]
+        counts = Counter(u.reason.value for u in unscanned)
+        injection = [
+            o.section_id for o in outcomes
+            if any(VerificationFlag.INJECTION_SUSPECTED.value in f.verification_flags
+                   for f in o.findings)
+        ]
 
-        reg_context = "\n\n".join(
-            f"[SOURCE {i + 1}] {c['regulation_ref']} (relevance: {c['score']:.2f})\n{c['text']}"
-            for i, c in enumerate(reg_chunks)
-        )
-
-        user_msg = USER_PROMPT_TEMPLATE.format(
+        return SOPScanResult(
             sop_id=sop_id,
-            section_id=clause.section_id,
-            heading=clause.heading,
-            clause_body=clause.body[:2000],
-            regulatory_context=reg_context,
+            sop_file=sop_path.name,
+            scan_timestamp=datetime.now(timezone.utc).isoformat(),
+            total_clauses_scanned=len(clauses),
+            gaps_found=len(findings),
+            findings=findings,
+            clauses_analysed=sum(1 for o in outcomes if o.status in ("ANALYSED", "NO_GAPS")),
+            unscanned_clauses=unscanned,
+            unscanned_count=len(unscanned),
+            flagged_findings_count=sum(1 for f in findings if f.is_flagged),
+            injection_suspected_clauses=injection,
+            error_counts=dict(counts),
+            llm_calls=self.budget.calls_made,
+            model=MODEL,
+            guardrails_version=GUARDRAILS_VERSION if self.enable_guardrails else None,
         )
 
-        try:
-            response = self.client.chat.completions.create(
-                model=MODEL,
-                max_tokens=4096,
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-            )
-        except Exception as exc:
-            logger.error(
-                "Claude API call failed for %s %s: %s",
-                sop_id, clause.section_id, exc,
-            )
-            return []
+    @staticmethod
+    def _build_registry(results: list[SOPScanResult]) -> GapRegistry:
+        findings = [f for r in results for f in r.findings]
+        versions = {r.guardrails_version for r in results}
+        return GapRegistry(
+            registry_timestamp=datetime.now(timezone.utc).isoformat(),
+            total_sops_scanned=len(results),
+            total_gaps_found=sum(r.gaps_found for r in results),
+            scans=results,
+            total_unscanned_clauses=sum(r.unscanned_count for r in results),
+            total_flagged_findings=sum(1 for f in findings if f.is_flagged),
+            total_verified_findings=sum(1 for f in findings if not f.is_flagged),
+            guardrails_version=(versions.pop() if len(versions) == 1 else GUARDRAILS_VERSION),
+        )
 
-        raw = response.choices[0].message.content.strip()
+    @staticmethod
+    def _fmt_counts(counts: dict[str, int]) -> str:
+        return ", ".join(f"{k}x{v}" for k, v in sorted(counts.items()))
 
-        # Strip accidental markdown fences
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
 
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.error(
-                "JSON parse failed for %s %s. Raw output: %s",
-                sop_id, clause.section_id, raw[:300],
-            )
-            return []
-
-        if not isinstance(data, list):
-            logger.error(
-                "Expected JSON array for %s %s, got %s",
-                sop_id, clause.section_id, type(data).__name__,
-            )
-            return []
-
-        findings: list[GapResult] = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            item["sop_id"] = sop_id  # inject sop_id (not part of Claude's output)
-            try:
-                findings.append(GapResult.model_validate(item))
-            except ValidationError as exc:
-                logger.warning(
-                    "Schema validation failed for %s %s: %s",
-                    sop_id, clause.section_id, exc,
-                )
-        return findings
+    def _write_result(self, result: SOPScanResult, out_dir: Path, sop_id: str) -> None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        per_sop_path = out_dir / f"gap_registry_{sop_id}.json"
+        # sop_id derives from an uploaded filename, so containment is checked
+        # rather than assumed.
+        if not per_sop_path.resolve().is_relative_to(out_dir.resolve()):
+            raise ScanAbort(f"refusing to write outside {out_dir}: {per_sop_path}")
+        per_sop_path.write_text(result.model_dump_json(indent=2))
+        logger.info("  Written: %s (%d gaps)", per_sop_path, result.gaps_found)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
+    def _check_file_limits(self, sop_path: Path) -> None:
+        if not sop_path.exists():
+            raise ScanAbort(f"File not found: {sop_path}")
+        size = sop_path.stat().st_size
+        if size > self.budget.max_sop_bytes:
+            raise ScanAbort(
+                f"{sop_path.name} is {size / 1024 / 1024:.1f} MB, over the "
+                f"{self.budget.max_sop_bytes / 1024 / 1024:.0f} MB limit."
+            )
+        if sop_path.suffix.lower() == ".pdf":
+            try:
+                import fitz
+                with fitz.open(str(sop_path)) as doc:
+                    if doc.page_count > self.budget.max_pdf_pages:
+                        raise ScanAbort(
+                            f"{sop_path.name} has {doc.page_count} pages, over the "
+                            f"{self.budget.max_pdf_pages} page limit."
+                        )
+            except ScanAbort:
+                raise
+            except Exception as exc:
+                raise ScanAbort(f"Could not open {sop_path.name}: {exc}") from exc
+
     @staticmethod
     def _extract_sop_id(path: Path) -> str:
-        """Extract SOP ID from filename, e.g. BC-MFG-UC-047 from BC-MFG-UC-047_..."""
+        """Extract SOP ID from filename, e.g. BC-MFG-UC-047 from BC-MFG-UC-047_...
+
+        The fallback is validated: this value is interpolated into a write path,
+        and an unvalidated filename segment could escape the output directory.
+        """
         stem = path.stem
         parts = stem.split("_")
-        # SOP IDs match the pattern XX-XXX-XX-000
-        for i, part in enumerate(parts):
+        for part in parts:
             if re.match(r'^[A-Z]{2}-[A-Z]{2,3}-[A-Z]{2}-\d+$', part):
                 return part
-        return parts[0] if parts else stem
+
+        candidate = parts[0] if parts else stem
+        if SOP_ID_RE.match(candidate) and candidate not in (".", ".."):
+            return candidate
+
+        import hashlib
+        digest = hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:12]
+        logger.warning("Unsafe SOP id %r from %s; using SOP-%s", candidate, path.name, digest)
+        return f"SOP-{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -431,31 +707,78 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--sop", type=Path, help="Path to a single SOP .docx file")
     group.add_argument("--all", action="store_true", help="Scan all SOPs in --sops directory")
+    parser.add_argument("--sops", type=Path, default=Path("sops"))
+    parser.add_argument("--out-dir", type=Path, default=Path("output"),
+                        help="Directory for gap_registry files (default: output)")
     parser.add_argument(
-        "--sops",
-        type=Path,
-        default=Path("sops"),
-        help="Directory containing SOP .docx files (used with --all)",
-    )
-    parser.add_argument(
-        "--chroma-path",
-        type=Path,
+        "--chroma-path", type=Path,
         default=Path(os.environ.get("CHROMA_PATH", "./chroma_db")),
     )
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--max-clauses", type=int, default=0,
+                        help="Cap clauses analysed per SOP (0 = use the budget default)")
+    parser.add_argument("--max-llm-calls", type=int, default=None)
+    parser.add_argument("--timeout", type=float, default=None,
+                        help="Per-call timeout in seconds")
+    parser.add_argument("--deadline", type=float, default=None,
+                        help="Whole-scan deadline in seconds")
+    parser.add_argument("--no-guardrails", action="store_true",
+                        help="Revert to legacy behaviour (no grounding or flagging)")
     args = parser.parse_args()
 
-    detector = SOPGapDetector(chroma_path=args.chroma_path)
+    budget = ScanBudget()
+    if args.max_llm_calls is not None:
+        budget.max_llm_calls = args.max_llm_calls
+    if args.timeout is not None:
+        budget.per_call_timeout_s = args.timeout
+    if args.deadline is not None:
+        budget.scan_deadline_s = args.deadline
 
-    if args.all:
-        registry = detector.scan_all(args.sops, workers=args.workers)
-        print(
-            f"\nScan complete — {registry.total_gaps_found} gaps found across "
-            f"{registry.total_sops_scanned} SOPs."
+    try:
+        detector = SOPGapDetector(
+            chroma_path=args.chroma_path,
+            budget=budget,
+            enable_guardrails=not args.no_guardrails,
         )
-    else:
-        result = detector.scan_sop(args.sop)
-        print(f"\nScan complete — {result.gaps_found} gaps found in {result.sop_id}.")
+
+        if args.all:
+            registry = detector.scan_all(
+                args.sops, workers=args.workers,
+                out_dir=args.out_dir, max_clauses=args.max_clauses,
+            )
+            attempted = sum(s.total_clauses_scanned for s in registry.scans)
+            unscanned = registry.total_unscanned_clauses
+            print(
+                f"\nScan complete — {registry.total_gaps_found} gaps found across "
+                f"{registry.total_sops_scanned} SOPs."
+            )
+            print(
+                f"Coverage: {attempted - unscanned}/{attempted} clauses analysed"
+                f"  |  {registry.total_flagged_findings} finding(s) need human verification"
+            )
+        else:
+            result = detector.scan_sop(
+                args.sop, out_dir=args.out_dir, max_clauses=args.max_clauses,
+            )
+            attempted, unscanned = result.total_clauses_scanned, result.unscanned_count
+            print(f"\nScan complete — {result.gaps_found} gaps found in {result.sop_id}.")
+            print(
+                f"Coverage: {result.analysed}/{attempted} clauses analysed"
+                f"  |  {result.flagged_findings_count} finding(s) need human verification"
+            )
+
+        if attempted > 0 and unscanned >= attempted:
+            print(
+                "\nERROR: no clause could be analysed. Every clause is UNSCANNED — "
+                "this is NOT a clean result.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    except ScanAbort as exc:
+        logger.error("Scan aborted: %s", exc)
+        print(f"\nScan aborted: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

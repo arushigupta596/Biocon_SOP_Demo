@@ -33,6 +33,12 @@ python -m src.ingest.embedder --source corpus/
 # Scan a single SOP
 python -m src.gap_engine.detector --sop sops/BC-MFG-UC-047.docx
 
+# Build the committed baseline registry the pre-demo test page reads
+python -m src.gap_engine.detector --all --sops sops/ --out-dir output/baseline
+
+# Guardrail unit tests — no API key or corpus needed
+pytest tests/test_guardrails.py -v
+
 # Scan all SOPs in parallel
 python -m src.gap_engine.detector --all --sops sops/
 
@@ -56,8 +62,32 @@ pytest tests/test_demo_gaps.py -v
 4. Vector store is local Chroma at ./chroma_db — no cloud vector store
 5. The Claude API call in detector.py must use temperature=0 for deterministic output
 6. Every gap finding must include: sop_clause, regulation_ref, gap_description, severity, remediation, confidence
-7. Report generator reads only from output/gap_registry.json — never calls the API directly
+7. Report generator reads only from a gap_registry.json — never calls the API directly
 8. WebFetch is disabled — all data is local
+
+### Guardrail rules (v1.0) — do not weaken these
+
+9.  **A clause never silently becomes "compliant".** Every failure path in the
+    detector must produce a typed `UnscannedClause`, never an empty finding
+    list. `return []` from an error branch is forbidden; an empty list means
+    only that the model assessed the clause and found nothing.
+10. **Flagging never removes or alters a finding.** Guardrails may set
+    `verification_status` / `verification_flags`, but must never change
+    `severity` or `confidence`. This is what keeps the demo tests green.
+11. **Untrusted text goes last in the prompt.** The SOP clause is uploaded by
+    the user and must stay inside `<untrusted_sop_clause>`, *after* the
+    regulatory context. Never interpolate raw document text before it.
+12. **Never render model output as HTML.** Anything from the model that reaches
+    a `unsafe_allow_html=True` block must pass through `safe_html()`.
+13. **Never print subprocess output raw.** Use `st_code()`, not `st.code()`, so
+    redaction always applies.
+14. **The app writes only inside `output/sessions/<sid>/`.** Globbing all of
+    `output/` merges other visitors' findings into a client's report.
+15. **Uploads go to `sops/uploads/<sid>/`,** never to `sops/`, so the bundled
+    demo SOPs cannot be overwritten.
+16. **The detector exits 0 on partial degradation.** `app.py` discards all
+    results on a non-zero code, so degradation is reported in the registry, not
+    the exit code. Exit 2 only when nothing at all could be analysed.
 
 ---
 
@@ -98,6 +128,24 @@ pytest tests/test_demo_gaps.py -v
 | BC-QC-BR-012_Batch_Record_Review.docx | BC-QC-BR-012 | §5.2 review timeline, §6.1 OOS procedure |
 | BC-RA-IM-008_Immunogenicity_Risk_Assessment.docx | BC-RA-IM-008 | §5.1 testing plan, §5.3 ADA assay validation |
 | BC-AN-MV-031_Analytical_Method_Validation_ProteinA_HPLC.docx | BC-AN-MV-031 | §6.3 system suitability, §8 method transfer |
+
+---
+
+## Known corpus gap — GAP 1 and GAP 2 will be flagged
+
+`corpus/` currently holds only 5 of the 12 documents listed below:
+`21_cfr_part_211`, `21_cfr_part_600_610`, `ich_q5e`, `ich_q10`, `ich_q11`.
+**No EMA documents are indexed.**
+
+GAP 1 cites `EMA CHMP/437/04 Rev1` and GAP 2 cites `EMA BWP/247713`. Neither is
+retrievable, so citation grounding flags both as `CITATION_NOT_IN_CORPUS` and
+they render as REQUIRES HUMAN VERIFICATION in the DOCX. This is the guardrail
+working correctly — it exposes a pre-existing corpus gap that the previous code
+hid. The tests still pass, because flagging never removes a finding.
+
+This is a deliberate, accepted state. Either ingest the missing EMA PDFs, or
+present the flags as evidence the system refuses to vouch for an ungrounded
+citation.
 
 ---
 

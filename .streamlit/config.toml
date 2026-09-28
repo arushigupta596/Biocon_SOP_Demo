@@ -7,8 +7,21 @@ font = "sans serif"
 
 [server]
 headless = true
-enableCORS = false
+# maxUploadSize must stay in step with MAX_UPLOAD_MB in src/guardrails/limits.py.
+# This rejects oversize uploads at the transport layer, before the bytes ever
+# reach app.py; the in-app size check remains as defence in depth.
+maxUploadSize = 10
+maxMessageSize = 50
+# enableCORS is deliberately NOT set to false here. Streamlit silently DISABLES
+# XSRF protection when enableCORS = false is combined with enableXsrfProtection
+# = true, so the previous config was running without the protection it appeared
+# to declare. Leaving enableCORS at its default (true) makes the line below real.
 enableXsrfProtection = true
+
+[client]
+# Uncaught exceptions must not render Python tracebacks into a visitor's browser;
+# frames can carry os.environ-derived strings.
+showErrorDetails = false
 
 [browser]
 gatherUsageStats = false
